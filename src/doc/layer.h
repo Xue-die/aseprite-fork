@@ -109,7 +109,7 @@ public:
 
   bool isVisibleHierarchy() const;
   bool isEditableHierarchy() const;
-  canEditPixels() const;
+  bool canEditPixels() const;
   bool hasAncestor(const Layer* ancestor) const;
   bool acceptCels() const { return !isGroup(); }
 
