@@ -70,9 +70,20 @@ void RenderPlan::processZIndexes() const
   // to preserve the correct z-order, but we don't need to render
   // non-visible layers.
   Items visibleItems;
+  bool currentBaseVisible = false;
   for (const Item& item : m_items) {
-    if (item.layer && item.layer->isVisibleHierarchy())
-      visibleItems.push_back(item);
+    if (!item.layer)
+      continue;
+
+    if (!item.layer->isClippingMask()) {
+      currentBaseVisible = item.layer->isVisibleHierarchy();
+      if (currentBaseVisible)
+        visibleItems.push_back(item);
+    }
+    else {
+      if (currentBaseVisible && item.layer->isVisibleHierarchy())
+        visibleItems.push_back(item);
+    }
   }
   m_items = std::move(visibleItems);
 }
