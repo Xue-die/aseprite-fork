@@ -40,7 +40,7 @@ namespace app {
 
 namespace {
 
-const char* DISCORD_CLIENT_ID = "455802283086938112";
+const char* DISCORD_CLIENT_ID = "1530800155740078223";
 
 int64_t getCurrentTimeSeconds()
 {
