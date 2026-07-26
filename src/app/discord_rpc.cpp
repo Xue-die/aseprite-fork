@@ -40,13 +40,20 @@ namespace app {
 
 namespace {
 
-const char* DISCORD_CLIENT_ID = "1332560505700876358";
+const char* DISCORD_CLIENT_ID = "455802283086938112";
 
 int64_t getCurrentTimeSeconds()
 {
   return std::chrono::duration_cast<std::chrono::seconds>(
            std::chrono::system_clock::now().time_since_epoch())
     .count();
+}
+
+std::string joinPath(std::string dir, const std::string& file)
+{
+  while (!dir.empty() && (dir.back() == '/' || dir.back() == '\\'))
+    dir.pop_back();
+  return dir + "/" + file;
 }
 
 std::string jsonEscape(const std::string& str)
@@ -210,20 +217,20 @@ bool DiscordRPC::connectSocket()
   }
 #else
   std::vector<std::string> searchPaths;
-  for (int i = 0; i < 10; ++i) {
-    searchPaths.push_back("/tmp/discord-ipc-" + std::to_string(i));
-  }
-
   const char* tmpdir = getenv("TMPDIR");
   if (tmpdir) {
     for (int i = 0; i < 10; ++i)
-      searchPaths.push_back(std::string(tmpdir) + "/discord-ipc-" + std::to_string(i));
+      searchPaths.push_back(joinPath(tmpdir, "discord-ipc-" + std::to_string(i)));
   }
 
   const char* xdg = getenv("XDG_RUNTIME_DIR");
   if (xdg) {
     for (int i = 0; i < 10; ++i)
-      searchPaths.push_back(std::string(xdg) + "/discord-ipc-" + std::to_string(i));
+      searchPaths.push_back(joinPath(xdg, "discord-ipc-" + std::to_string(i)));
+  }
+
+  for (int i = 0; i < 10; ++i) {
+    searchPaths.push_back("/tmp/discord-ipc-" + std::to_string(i));
   }
 
   for (const auto& path : searchPaths) {
