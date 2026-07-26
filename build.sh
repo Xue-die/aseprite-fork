@@ -469,7 +469,7 @@ if [ ! -f "$active_build_dir/ninja.build" ] ; then
     fi
 
     if [ $is_macos ] ; then
-        osx_deployment_target="-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0"
+        osx_deployment_target="-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DCMAKE_OSX_ARCHITECTURES=$cpu"
     else
         osx_deployment_target=
     fi
