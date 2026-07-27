@@ -14,6 +14,7 @@
 #include "base/gcd.h"
 #include "doc/blend_internals.h"
 #include "doc/blend_mode.h"
+#include "doc/color.h"
 #include "doc/doc.h"
 #include "doc/image.h"
 #include "doc/layer_tilemap.h"
@@ -422,7 +423,7 @@ void composite_image_general_with_tile_flags(Image* dst,
                       area.dstBounds().y,
                       int(std::ceil(area.dstBounds().w)),
                       int(std::ceil(area.dstBounds().h)));
-  gfx::Rect srcBounds = area.srcBounds();
+  gfx::RectF srcBounds = area.srcBounds();
   const gfx::Rect srcImgBounds = src->bounds();
   const gfx::Size srcMinSize = src->size();
 
@@ -1073,49 +1074,220 @@ void Render::renderPlan(RenderPlan& plan,
             if (!isSelected && m_nonactiveLayersOpacity != 255)
               opacity = MUL_UN8(opacity, m_nonactiveLayersOpacity, t);
 
-            // Generally this is just one pass, but if we are using
-            // OVER_COMPOSITE extra cel, this will be two passes.
-            for (int pass = 0; pass < 2; ++pass) {
-              // Draw parts outside the "m_extraCel" area
-              if (drawExtra && m_extraType == ExtraType::PATCH) {
-                gfx::Region originalAreas(area.srcBounds());
-                originalAreas.createSubtraction(originalAreas, gfx::Region(extraArea));
+            if (layer->isClippingMask()) {
+              // --- Clipping Mask Compositing ---
+              // Render this clipping mask layer into a temporary image,
+              // then mask it against the base layer's alpha, and composite
+              // the masked result into the main image.
 
-                for (auto rc : originalAreas) {
-                  renderCel(
-                    image,
-                    cel,
-                    celImage,
-                    layer,
-                    pal,
-                    celBounds,
-                    gfx::Clip(area.dst.x + rc.x - area.src.x, area.dst.y + rc.y - area.src.y, rc),
-                    compositeImage,
-                    opacity,
-                    layerBlendMode);
+              // Find the base layer for this clipping mask: the last
+              // non-clipping-mask layer before this one in the plan items.
+              const Image* baseImage = nullptr;
+              gfx::RectF baseBounds;
+              const Cel* baseCel = nullptr;
+              const Layer* baseLayer = nullptr;
+
+              const auto& items = plan.items();
+              for (auto it = items.begin(); it != items.end(); ++it) {
+                if (it->layer == layer)
+                  break;
+                if (!it->layer->isClippingMask()) {
+                  baseLayer = it->layer;
+                  baseCel = it->cel ? it->cel : it->layer->cel(frame);
                 }
               }
-              // Draw the whole cel
-              else {
-                renderCel(image,
-                          cel,
-                          celImage,
-                          layer,
-                          pal,
-                          celBounds,
-                          area,
-                          compositeImage,
-                          opacity,
-                          layerBlendMode);
+
+              if (baseCel) {
+                if (m_previewImage && baseLayer && checkIfWeShouldUsePreview(baseCel)) {
+                  baseImage = m_previewImage;
+                  baseBounds = gfx::RectF(m_previewPos.x, m_previewPos.y,
+                                          m_previewImage->width(), m_previewImage->height());
+                }
+                else {
+                  baseImage = baseCel->image();
+                  if (baseLayer && baseLayer->isReference())
+                    baseBounds = baseCel->boundsF();
+                  else
+                    baseBounds = baseCel->bounds();
+                }
               }
 
-              if (m_extraType == ExtraType::OVER_COMPOSITE && layer == m_currentLayer &&
-                  pass == 0) {
-                // Go for second pass with the extra blend mode...
-                layerBlendMode = m_extraBlendMode;
+              if (baseImage) {
+                // Render the clipping mask cel into a blank temp image
+                ImageRef tempImage(Image::create(image->spec()));
+                tempImage->clear(0);
+
+                // Render clipping mask layer into tempImage
+                BlendMode tempBlendMode = layerBlendMode;
+                for (int pass = 0; pass < 2; ++pass) {
+                  if (drawExtra && m_extraType == ExtraType::PATCH) {
+                    gfx::Region originalAreas(area.srcBounds());
+                    originalAreas.createSubtraction(originalAreas, gfx::Region(extraArea));
+                    for (auto rc : originalAreas) {
+                      renderCel(tempImage.get(), cel, celImage, layer, pal, celBounds,
+                                gfx::Clip(area.dst.x + rc.x - area.src.x, area.dst.y + rc.y - area.src.y, rc),
+                                compositeImage, opacity, tempBlendMode);
+                    }
+                  }
+                  else {
+                    renderCel(tempImage.get(), cel, celImage, layer, pal, celBounds,
+                              area, compositeImage, opacity, tempBlendMode);
+                  }
+
+                  if (m_extraType == ExtraType::OVER_COMPOSITE && layer == m_currentLayer &&
+                      pass == 0) {
+                    tempBlendMode = m_extraBlendMode;
+                  }
+                  else
+                    break;
+                }
+
+                // Render extra cel (brush cursor preview / active stroke) into tempImage
+                // so it is drawn ON TOP OF the clipping mask layer and correctly masked
+                // against the base layer's alpha shape.
+                if (drawExtra && m_extraType != ExtraType::NONE && m_extraCel && m_extraCel->opacity() > 0) {
+                  renderCel(tempImage.get(),
+                            m_extraCel,
+                            m_sprite,
+                            m_extraImage,
+                            m_currentLayer,
+                            m_sprite->palette(frame),
+                            m_extraCel->bounds(),
+                            gfx::Clip(area.dst.x + extraArea.x - area.src.x,
+                                      area.dst.y + extraArea.y - area.src.y,
+                                      extraArea),
+                            m_extraCel->opacity(),
+                            m_extraBlendMode);
+                }
+
+                // Render the base layer into a separate baseMask image to get its alpha
+                ImageRef baseMaskImage(Image::create(image->spec()));
+                baseMaskImage->clear(0);
+                int baseOpacity = baseCel->opacity();
+                if (baseLayer) {
+                  baseOpacity = MUL_UN8(baseOpacity, baseLayer->opacity(), t);
+                  baseOpacity = MUL_UN8(baseOpacity, m_globalOpacity, t);
+                  if (m_selectedLayerForOpacity != baseLayer && m_nonactiveLayersOpacity != 255)
+                    baseOpacity = MUL_UN8(baseOpacity, m_nonactiveLayersOpacity, t);
+                }
+                BlendMode baseBlendMode = (blendMode == BlendMode::UNSPECIFIED && baseLayer ?
+                                           baseLayer->blendMode() : blendMode);
+                renderCel(baseMaskImage.get(), baseCel, baseImage, baseLayer, pal,
+                          baseBounds, area, compositeImage, baseOpacity, baseBlendMode);
+
+                // Mask tempImage against baseMaskImage:
+                // For each pixel in tempImage, multiply its alpha by the alpha of baseMaskImage.
+                // This restricts the clipping mask to only appear where the base layer has pixels.
+                const int w = image->width();
+                const int h = image->height();
+
+                switch (image->pixelFormat()) {
+                  case IMAGE_RGB: {
+                    for (int y = 0; y < h; ++y) {
+                      uint32_t* dst = reinterpret_cast<uint32_t*>(tempImage->getPixelAddress(0, y));
+                      const uint32_t* mask = reinterpret_cast<const uint32_t*>(baseMaskImage->getPixelAddress(0, y));
+                      for (int x = 0; x < w; ++x, ++dst, ++mask) {
+                        const uint8_t baseAlpha = rgba_geta(*mask);
+                        const uint8_t srcAlpha = rgba_geta(*dst);
+                        const uint8_t newAlpha = MUL_UN8(srcAlpha, baseAlpha, t);
+                        *dst = (*dst & ~rgba_a_mask) | (uint32_t(newAlpha) << rgba_a_shift);
+                      }
+                    }
+                    break;
+                  }
+                  case IMAGE_GRAYSCALE: {
+                    for (int y = 0; y < h; ++y) {
+                      uint16_t* dst = reinterpret_cast<uint16_t*>(tempImage->getPixelAddress(0, y));
+                      const uint16_t* mask = reinterpret_cast<const uint16_t*>(baseMaskImage->getPixelAddress(0, y));
+                      for (int x = 0; x < w; ++x, ++dst, ++mask) {
+                        const uint8_t baseAlpha = graya_geta(*mask);
+                        const uint8_t srcAlpha = graya_geta(*dst);
+                        const uint8_t newAlpha = MUL_UN8(srcAlpha, baseAlpha, t);
+                        *dst = (*dst & ~graya_a_mask) | (uint16_t(newAlpha) << graya_a_shift);
+                      }
+                    }
+                    break;
+                  }
+                  default:
+                    // For indexed mode, no alpha masking (no alpha channel)
+                    break;
+                }
+
+                // Composite the masked temp image into the main image
+                composite_image(image, tempImage.get(), pal, 0, 0, 255, BlendMode::NORMAL);
               }
-              else
-                break;
+              else {
+                // No base layer found; render normally as a fallback
+                for (int pass = 0; pass < 2; ++pass) {
+                  if (drawExtra && m_extraType == ExtraType::PATCH) {
+                    gfx::Region originalAreas(area.srcBounds());
+                    originalAreas.createSubtraction(originalAreas, gfx::Region(extraArea));
+                    for (auto rc : originalAreas) {
+                      renderCel(image, cel, celImage, layer, pal, celBounds,
+                                gfx::Clip(area.dst.x + rc.x - area.src.x, area.dst.y + rc.y - area.src.y, rc),
+                                compositeImage, opacity, layerBlendMode);
+                    }
+                  }
+                  else {
+                    renderCel(image, cel, celImage, layer, pal, celBounds,
+                              area, compositeImage, opacity, layerBlendMode);
+                  }
+
+                  if (m_extraType == ExtraType::OVER_COMPOSITE && layer == m_currentLayer &&
+                      pass == 0) {
+                    layerBlendMode = m_extraBlendMode;
+                  }
+                  else
+                    break;
+                }
+              }
+            }
+            else {
+              // --- Normal Layer Compositing ---
+              // Generally this is just one pass, but if we are using
+              // OVER_COMPOSITE extra cel, this will be two passes.
+              for (int pass = 0; pass < 2; ++pass) {
+                // Draw parts outside the "m_extraCel" area
+                if (drawExtra && m_extraType == ExtraType::PATCH) {
+                  gfx::Region originalAreas(area.srcBounds());
+                  originalAreas.createSubtraction(originalAreas, gfx::Region(extraArea));
+
+                  for (auto rc : originalAreas) {
+                    renderCel(
+                      image,
+                      cel,
+                      celImage,
+                      layer,
+                      pal,
+                      celBounds,
+                      gfx::Clip(area.dst.x + rc.x - area.src.x, area.dst.y + rc.y - area.src.y, rc),
+                      compositeImage,
+                      opacity,
+                      layerBlendMode);
+                  }
+                }
+                // Draw the whole cel
+                else {
+                  renderCel(image,
+                            cel,
+                            celImage,
+                            layer,
+                            pal,
+                            celBounds,
+                            area,
+                            compositeImage,
+                            opacity,
+                            layerBlendMode);
+                }
+
+                if (m_extraType == ExtraType::OVER_COMPOSITE && layer == m_currentLayer &&
+                    pass == 0) {
+                  // Go for second pass with the extra blend mode...
+                  layerBlendMode = m_extraBlendMode;
+                }
+                else
+                  break;
+              }
             }
           }
         }
@@ -1162,7 +1334,7 @@ void Render::renderPlan(RenderPlan& plan,
     }
 
     // Draw extras
-    if (drawExtra && m_extraType != ExtraType::NONE) {
+    if (drawExtra && m_extraType != ExtraType::NONE && !layer->isClippingMask()) {
       if (m_extraCel->opacity() > 0) {
         renderCel(image,
                   m_extraCel,
