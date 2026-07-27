@@ -3,6 +3,7 @@ mkdir -p build
 cd build
 cmake -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 \
   -DENABLE_UI=ON \
   -DENABLE_DESKTOP_INTEGRATION=OFF \
   -DENABLE_SCRIPTING=ON \
