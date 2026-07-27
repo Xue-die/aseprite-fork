@@ -105,6 +105,7 @@ void LayerClippingMaskCommand::onExecute(Context* context)
   }
   tx.commit();
 
+  doc->notifyGeneralUpdate();
   update_screen_for_document(writer.document());
 }
 

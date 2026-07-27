@@ -28,11 +28,12 @@
 #include "app/file/file.h"
 #include "app/file/file_formats_manager.h"
 #include "app/file_system.h"
+#include "app/font_path.h"
 #include "app/gui_xml.h"
 #include "app/i18n/strings.h"
-#include "app/ini_file.h"
+#include "app/job.h"
 #include "app/log.h"
-#include "app/modules.h"
+#include "app/main_window.h"
 #include "app/modules/gfx.h"
 #include "app/modules/gui.h"
 #include "app/modules/palettes.h"
@@ -40,355 +41,264 @@
 #include "app/recent_files.h"
 #include "app/resource_finder.h"
 #include "app/send_crash.h"
-#include "app/site.h"
 #include "app/tools/active_tool.h"
 #include "app/tools/tool_box.h"
-#include "app/ui/backup_indicator.h"
-#include "app/ui/color_bar.h"
-#include "app/ui/doc_view.h"
+#include "app/ui/context_bar.h"
+#include "app/ui/devconsole_view.h"
 #include "app/ui/editor/editor.h"
-#include "app/ui/editor/editor_view.h"
 #include "app/ui/input_chain.h"
 #include "app/ui/keyboard_shortcuts.h"
-#include "app/ui/main_window.h"
 #include "app/ui/status_bar.h"
-#include "app/ui/toolbar.h"
+#include "app/ui/timeline/timeline.h"
 #include "app/ui/workspace.h"
 #include "app/ui_context.h"
 #include "app/util/clipboard.h"
+#include "app/user_agent.h"
 #include "base/exception.h"
 #include "base/fs.h"
-#include "base/platform.h"
-#include "base/replace_string.h"
-#include "base/split_string.h"
-#include "doc/sprite.h"
+#include "base/memory.h"
+#include "doc/doc.h"
 #include "fmt/format.h"
 #include "os/error.h"
-#include "os/surface.h"
+#include "os/font.h"
 #include "os/system.h"
-#include "os/window.h"
-#include "render/render.h"
-#include "ui/intern.h"
-#include "ui/ui.h"
-#include "updater/user_agent.h"
-#include "ver/info.h"
-
-#if LAF_MACOS
-  #include "os/osx/system.h"
-#elif LAF_LINUX
-  #include "os/x11/system.h"
-#endif
-
-#ifdef ENABLE_STEAM
-  #include "steam/steam.h"
-#endif
+#include "ui/alert.h"
 
 #include <iostream>
 
 namespace app {
 
-App* App::m_instance = NULL;
+static App* g_instance = nullptr;
+
+App* App::instance()
+{
+  return g_instance;
+}
 
 class App::CoreModules {
 public:
-  CoreModules()
-  {
-    // Initialize the logging module.
-    m_loggerModule = std::make_unique<LoggerModule>();
-
-    // Initialize system.
-    m_system = os::make_system();
-
-    // Register all image formats.
-    m_fileFormatsManager = std::make_unique<FileFormatsManager>();
-  }
-
-  os::System* system() { return m_system.get(); }
-
-private:
-  std::unique_ptr<LoggerModule> m_loggerModule;
-  os::SystemRef m_system;
-  std::unique_ptr<FileFormatsManager> m_fileFormatsManager;
+  ConfigModule m_configModule;
+  app::UIContext m_context;
 };
 
 class App::Modules {
 public:
-  Modules(const bool createLogInDesktop, Preferences& pref)
-    : m_gfxModule(createLogInDesktop)
-    , m_guiModule(pref)
+  LoggerModule m_loggerModule;
+  FileSystemModule m_file_system_module;
+  Extensions m_extensions;
+  Strings m_strings; // Load main language (after loading the extensions)
+  tools::ToolBox m_toolbox;
+  tools::ActiveToolManager m_activeToolManager;
+  Commands m_commands;
+  RecentFiles m_recent_files;
+  InputChain m_inputChain;
+  Clipboard m_clipboard;
+#ifdef ENABLE_DATA_RECOVERY
+  // This is a raw pointer because we want to delete it explicitly.
+  // (e.g. if an exception occurs, the ~Modules() doesn't have to
+  // delete m_recovery)
+  crash::DataRecovery* m_dataRecovery;
+#endif
+
+  Modules(bool createLogInDesktop, Preferences& pref)
+    : m_loggerModule(createLogInDesktop)
+    , m_extensions(pref.extensions.disabledExtensions)
+    , m_strings(pref.general.language(), m_extensions)
+    , m_activeToolManager(&m_toolbox)
+#ifdef ENABLE_DATA_RECOVERY
+    , m_dataRecovery(nullptr)
+#endif
   {
+#ifdef ENABLE_DATA_RECOVERY
+    if (pref.general.dataRecovery()) {
+      m_dataRecovery = new crash::DataRecovery(&m_context);
+    }
+#endif
   }
 
-  void createDataRecovery(Context* ctx)
+  ~Modules()
   {
-    m_dataRecovery = std::make_unique<crash::DataRecovery>(ctx);
+    deleteDataRecovery();
   }
 
-  void deleteDataRecovery() { m_dataRecovery.reset(); }
+  void deleteDataRecovery()
+  {
+#ifdef ENABLE_DATA_RECOVERY
+    delete m_dataRecovery;
+    m_dataRecovery = nullptr;
+#endif
+  }
 
   void searchDataRecoverySessions()
   {
+#ifdef ENABLE_DATA_RECOVERY
     if (m_dataRecovery)
-      m_dataRecovery->searchSessions();
+      m_dataRecovery->searchForSessions();
+#endif
   }
 
-  crash::DataRecovery* recovery() { return m_dataRecovery.get(); }
+  crash::DataRecovery* recovery()
+  {
+#ifdef ENABLE_DATA_RECOVERY
+    return m_dataRecovery;
+#else
+    return nullptr;
+#endif
+  }
 
   GfxModule m_gfxModule;
   GuiModule m_guiModule;
   PalettesModule m_palettesModule;
-  tools::ToolBox m_toolbox;
-  tools::ActiveToolManager m_activeToolManager { &m_toolbox };
-  RecentFiles m_recent_files;
-  InputChain m_inputChain;
-  ClipboardImpl m_clipboard;
-  Extensions m_extensions;
-  std::unique_ptr<crash::DataRecovery> m_dataRecovery;
 };
 
-class App::LegacyModules {
-public:
-  LegacyModules(int flags)
-  {
-    if (app_init_modules(flags) < 0)
-      throw base::Exception("Cannot initialize all legacy modules.");
-  }
-
-  ~LegacyModules() { app_exit_modules(); }
-};
-
-App::App(AppMod* mod)
-  : m_mod(mod)
+App::App(AppOptions& options)
+  : m_options(options)
+  , m_coreModules(nullptr)
+  , m_modules(nullptr)
+  , m_legacyModules(nullptr)
   , m_isGui(false)
   , m_isShell(false)
 {
-  ASSERT(m_instance == NULL);
-  m_instance = this;
+  ASSERT(g_instance == nullptr);
+  g_instance = this;
+
+  m_system = os::make_system();
 }
 
 App::~App()
 {
-  m_instance = NULL;
+  try {
+    // Delete modules in reverse order.
+    m_modules.reset();
+
+    // Delete core modules.
+    m_coreModules.reset();
+  }
+  catch (const std::exception& e) {
+    LOG(ERROR, "Aseprite cleanup error: %s\n", e.what());
+  }
+
+  g_instance = nullptr;
+}
+
+void App::initialize()
+{
+  m_coreModules = std::make_unique<CoreModules>();
+
+  Preferences& pref = preferences();
+
+  // Color management options
+  ColorSpaces::init();
+  ColorSpaces::convertProfilesToSrgb(pref.color::convertProfilesToSrgb());
+
+  UserAgent::set(fmt::format("Aseprite/{}", get_app_version()));
+
+  // Document system options
+  m_isGui = m_options.isGui();
+  m_isShell = m_options.isShell();
+
+  // Create UIContext if GUI mode is enabled
+  if (m_isGui) {
+    // Load strings before creating modules
+    std::string lang = pref.general.language();
+    if (!lang.empty()) {
+      Strings::createInstance(lang);
+    }
+    else {
+      Strings::createInstance("en");
+    }
+  }
+
+  bool createLogInDesktop = false;
+#if ENABLE_DESKTOP_LOG
+  createLogInDesktop = true;
+#endif
+
+  m_modules = std::make_unique<Modules>(createLogInDesktop, pref);
+
+  if (m_isGui) {
+    // Legacy modules setup
+    m_legacyModules = std::make_unique<LegacyModules>();
+
+    // Load GUI layout/theme
+    KeyboardShortcuts::instance()->importFile(gui_xml_file());
+  }
+}
+
+void App::run()
+{
+  // Main execution loop
+  if (m_isGui) {
+    MainWindow mainWindow(m_options);
+    m_mainWindow = &mainWindow;
+
+    mainWindow.show();
+
+    // Search for crashes/data recovery
+    if (m_modules->recovery()) {
+      m_modules->searchDataRecoverySessions();
+    }
+
+    // Run UI event loop
+    ui::Manager::getDefault()->run();
+
+    m_mainWindow = nullptr;
+  }
 }
 
 Context* App::context()
 {
-  return UIContext::instance();
+  return m_coreModules ? &m_coreModules->m_context : nullptr;
 }
 
-bool App::isPortable()
-{
-  static int portable = -1;
-  if (portable < 0) {
-    portable = base::is_file(base::join_path(base::get_app_path(), "aseprite.ini")) ? 1 : 0;
-  }
-  return portable == 1;
-}
-
-int App::initialize(const AppOptions& options)
-{
-  m_coreModules = std::make_unique<CoreModules>();
-
-  os::System* system = m_coreModules->system();
-  if (!system)
-    return 1;
-
-  // Initialize preferences
-  Preferences& pref = preferences();
-
-  // Set high-dpi awareness
-  system->setAppMode(os::AppMode::GUI);
-  system->setGpuAcceleration(pref.general.gpuAcceleration());
-
-  // Show CLI-only warning on Windows/macOS if we try to run in GUI
-  // mode without Skia backend.
-#if !LAF_SKIA
-  m_showCliOnlyWarning = (system->gpuAcceleration() ||
-                          pref.general.screenScale() > 1 ||
-                          pref.general.uiScale() > 1);
-#endif
-
-  // Configure DRM / license key
-  app_configure_drm();
-
-  // Color spaces
-  ColorSpaces::init();
-
-  // Set the user agent for HTTP requests
-  UserAgent::set(fmt::format("Aseprite/{}", get_app_version()));
-
-  // GUI mode
-  m_isGui = options.isGui();
-  m_isShell = options.isShell();
-
-#ifdef ENABLE_SCRIPTING
-  // Initialize Lua engine
-  m_engine = std::make_unique<script::Engine>();
-#endif
-
-  // Initialize GUI system
-  if (isGui()) {
-    m_uiSystem = std::make_unique<ui::UISystem>();
-
-    // Setup language
-    std::string lang = pref.general.language();
-    Strings::createInstance(lang);
-  }
-  else {
-    // English strings for CLI mode
-    Strings::createInstance("en");
-  }
-
-#ifdef ENABLE_STEAM
-  if (m_inAppSteam) {
-    steam::init();
-  }
-#endif
-
-  // Load modules
-  m_modules = std::make_unique<Modules>(createLogInDesktop, pref);
-  m_legacy = std::make_unique<LegacyModules>(isGui() ? REQUIRE_INTERFACE : 0);
-  m_appMenus = std::make_unique<AppMenus>(recentFiles());
-  m_brushes = std::make_unique<AppBrushes>();
-
-  // Data recovery is enabled only in GUI mode
-  if (isGui() && pref.general.dataRecovery())
-    m_modules->createDataRecovery(context());
-
-  if (isPortable())
-    LOG("APP: Running in portable mode\n");
-
-  // Load or create the default palette, or migrate the default
-  // palette from an old format palette to the new one, etc.
-  load_default_palette();
-
-  // Initialize GUI interface
-  if (isGui()) {
-    LOG("APP: GUI mode\n");
-
-    // Set the ClipboardDelegate impl to copy/paste text in the native
-    // clipboard from the ui::Entry control.
-    m_uiSystem->setClipboardDelegate(&m_modules->m_clipboard);
-
-    // Setup the GUI cursor and redraw screen
-    ui::set_use_native_cursors(pref.cursor.useNativeCursor());
-    ui::set_mouse_cursor_scale(pref.cursor.cursorScale());
-    ui::set_mouse_cursor(kArrowCursor);
-
-    auto manager = ui::Manager::getDefault();
-    manager->invalidate();
-
-    // Create the main window.
-    m_mainWindow.reset(new MainWindow);
-    m_mainWindow->initialize();
-    if (m_mod)
-      m_mod->modMainWindow(m_mainWindow.get());
-
-    // Data recovery is enabled only in GUI mode
-    if (pref.general.dataRecovery())
-      m_modules->searchDataRecoverySessions();
-
-    // Default status of the main window.
-    app_rebuild_documents_tabs();
-    m_mainWindow->statusBar()->showDefaultText();
-
-    // Show the main window (this is not modal, the code continues)
-    m_mainWindow->openWindow();
-
-#if LAF_LINUX // TODO check why this is required and we cannot call
-              //      updateAllDisplays() on Linux/X11
-    // Redraw the whole screen.
-    manager->invalidate();
-#else
-    // To know the initial manager size we call to
-    // Manager::updateAllDisplays(...) so we receive a
-    // Manager::onNewDisplayConfiguration() (which will update the
-    // bounds of the manager for first time).  This is required so if
-    // the OpenFileCommand (called when we're processing the CLI with
-    // OpenBatchOfFiles) shows a dialog to open a sequence of files,
-    // the dialog is centered correctly to the manager bounds.
-    const int scale = Preferences::instance().general.screenScale();
-    const bool gpu = Preferences::instance().general.gpuAcceleration();
-    manager->updateAllDisplays(scale, gpu);
-#endif
-  }
-
-#ifdef ENABLE_SCRIPTING
-  // Call the init() function from all plugins
-  LOG("APP: Initializing scripts...\n");
-  extensions().executeInitActions();
-#endif
-
-  // Process options
-  LOG("APP: Processing options...\n");
-  int code;
-  {
-    std::unique_ptr<CliDelegate> delegate;
-    if (options.previewCLI())
-      delegate.reset(new PreviewCliDelegate);
-    else
-      delegate.reset(new DefaultCliDelegate);
-
-    CliProcessor cli(delegate.get(), options);
-    code = cli.process(context());
-  }
-
-  LOG("APP: Finish launching...\n");
-  system->finishLaunching();
-  return code;
-}
-
-void App::run(bool runGuiManager)
-{
-  if (isGui()) {
-    if (runGuiManager) {
-      ui::Manager::getDefault()->run();
-    }
-  }
-}
-
-void App::showNotification(INotificationDelegate* del)
-{
-  if (m_mainWindow)
-    m_mainWindow->showNotification(del);
-}
-
-void App::showBackupNotification(bool state)
-{
-  if (state) {
-    if (!m_backupIndicator)
-      m_backupIndicator = std::make_unique<BackupIndicator>();
-    m_backupIndicator->start();
-  }
-  else if (m_backupIndicator) {
-    m_backupIndicator->stop();
-  }
-}
-
-void App::updateDisplayTitleBar()
-{
-  if (m_mainWindow)
-    m_mainWindow->updateTitleBar();
-}
-
-InputChain& App::inputChain()
-{
-  return m_modules->m_inputChain;
-}
-
-Preferences& App::preferences()
+Preferences& App::preferences() const
 {
   return Preferences::instance();
 }
 
-Extensions& App::extensions()
+Extensions& App::extensions() const
 {
   return m_modules->m_extensions;
 }
 
+tools::ToolBox* App::toolBox() const
+{
+  return &m_modules->m_toolbox;
+}
+
+tools::ActiveToolManager* App::activeToolManager() const
+{
+  return &m_modules->m_activeToolManager;
+}
+
+RecentFiles* App::recentFiles() const
+{
+  return &m_modules->m_recent_files;
+}
+
+InputChain& App::inputChain() const
+{
+  return m_modules->m_inputChain;
+}
+
+MainWindow* App::mainWindow() const
+{
+  return m_mainWindow;
+}
+
+Workspace* App::workspace() const
+{
+  return m_mainWindow ? m_mainWindow->workspace() : nullptr;
+}
+
+Timeline* App::timeline() const
+{
+  return m_mainWindow ? m_mainWindow->timeline() : nullptr;
+}
+
 crash::DataRecovery* App::dataRecovery() const
 {
-  return m_modules->recovery();
+  return m_modules ? m_modules->recovery() : nullptr;
 }
 
 } // namespace app
