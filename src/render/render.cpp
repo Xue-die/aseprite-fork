@@ -423,7 +423,7 @@ void composite_image_general_with_tile_flags(Image* dst,
                       area.dstBounds().y,
                       int(std::ceil(area.dstBounds().w)),
                       int(std::ceil(area.dstBounds().h)));
-  gfx::RectF srcBounds = area.srcBounds();
+  gfx::Rect srcBounds = area.srcBounds();
   const gfx::Rect srcImgBounds = src->bounds();
   const gfx::Size srcMinSize = src->size();
 
@@ -973,7 +973,12 @@ void Render::renderPlan(RenderPlan& plan,
                         const bool render_transparent,
                         const BlendMode blendMode)
 {
-  for (const auto& item : plan.items()) {
+  bool pendingBaseExtra = false;
+  gfx::Rect pendingExtraArea;
+
+  const auto& items = plan.items();
+  for (auto it = items.begin(); it != items.end(); ++it) {
+    const auto& item = *it;
     const Cel* cel = item.cel;
     const Layer* layer = item.layer;
 
@@ -1335,20 +1340,49 @@ void Render::renderPlan(RenderPlan& plan,
 
     // Draw extras
     if (drawExtra && m_extraType != ExtraType::NONE && !layer->isClippingMask()) {
-      if (m_extraCel->opacity() > 0) {
-        renderCel(image,
-                  m_extraCel,
-                  m_sprite,
-                  m_extraImage,
-                  m_currentLayer, // Current layer (useful to use get the tileset if extra cel is a
-                                  // tilemap)
-                  m_sprite->palette(frame),
-                  m_extraCel->bounds(),
-                  gfx::Clip(area.dst.x + extraArea.x - area.src.x,
-                            area.dst.y + extraArea.y - area.src.y,
-                            extraArea),
-                  m_extraCel->opacity(),
-                  m_extraBlendMode);
+      auto nextIt = it + 1;
+      bool hasClippingMasksAfter = (nextIt != items.end() && nextIt->layer->isClippingMask());
+
+      if (hasClippingMasksAfter) {
+        pendingBaseExtra = true;
+        pendingExtraArea = extraArea;
+      }
+      else {
+        if (m_extraCel->opacity() > 0) {
+          renderCel(image,
+                    m_extraCel,
+                    m_sprite,
+                    m_extraImage,
+                    m_currentLayer, // Current layer
+                    m_sprite->palette(frame),
+                    m_extraCel->bounds(),
+                    gfx::Clip(area.dst.x + extraArea.x - area.src.x,
+                              area.dst.y + extraArea.y - area.src.y,
+                              extraArea),
+                    m_extraCel->opacity(),
+                    m_extraBlendMode);
+        }
+      }
+    }
+
+    if (pendingBaseExtra) {
+      auto nextIt = it + 1;
+      if (nextIt == items.end() || !nextIt->layer->isClippingMask()) {
+        if (m_extraCel->opacity() > 0) {
+          renderCel(image,
+                    m_extraCel,
+                    m_sprite,
+                    m_extraImage,
+                    m_currentLayer,
+                    m_sprite->palette(frame),
+                    m_extraCel->bounds(),
+                    gfx::Clip(area.dst.x + pendingExtraArea.x - area.src.x,
+                              area.dst.y + pendingExtraArea.y - area.src.y,
+                              pendingExtraArea),
+                    m_extraCel->opacity(),
+                    m_extraBlendMode);
+        }
+        pendingBaseExtra = false;
       }
     }
   }
