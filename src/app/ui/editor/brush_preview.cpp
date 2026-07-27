@@ -379,16 +379,30 @@ void BrushPreview::show(const gfx::Point& screenPos)
       clear_image(extraImage, (extraImage->pixelFormat() == IMAGE_INDEXED ? mask_index : 0));
     }
 
+    bool isClippingContext = false;
     if (layer) {
+      if (layer->isClippingMask()) {
+        isClippingContext = true;
+      }
+      else if (layer->parent()) {
+        const auto& sublayers = layer->parent()->layers();
+        auto lIt = std::find(sublayers.begin(), sublayers.end(), layer);
+        if (lIt != sublayers.end() && (lIt + 1) != sublayers.end()) {
+          if ((*(lIt + 1))->isClippingMask())
+            isClippingContext = true;
+        }
+      }
+    }
+
+    if (layer && !isClippingContext) {
       render::Render().renderLayer(extraImage,
                                    layer,
                                    site.frame(),
                                    gfx::Clip(0, 0, extraCelBoundsInCanvas),
                                    BlendMode::SRC);
-
-      // This extra cel is a patch for the current layer/frame
-      m_extraCel->setType(render::ExtraType::PATCH);
     }
+    // This extra cel is a patch for the current layer/frame
+    m_extraCel->setType(render::ExtraType::PATCH);
 
     {
       std::unique_ptr<tools::ToolLoop> loop(

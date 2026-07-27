@@ -423,7 +423,7 @@ void composite_image_general_with_tile_flags(Image* dst,
                       area.dstBounds().y,
                       int(std::ceil(area.dstBounds().w)),
                       int(std::ceil(area.dstBounds().h)));
-  gfx::Rect srcBounds = area.srcBounds();
+  gfx::RectF srcBounds = area.srcBounds();
   const gfx::Rect srcImgBounds = src->bounds();
   const gfx::Size srcMinSize = src->size();
 
@@ -982,6 +982,9 @@ void Render::renderPlan(RenderPlan& plan,
     const Cel* cel = item.cel;
     const Layer* layer = item.layer;
 
+    auto nextIt = it + 1;
+    const bool hasClippingMasksAfter = (nextIt != items.end() && nextIt->layer->isClippingMask());
+
     ASSERT(layer->isVisible()); // Hidden layers shouldn't be in the plan
 
     const bool isSelected = (m_selectedLayerForOpacity == layer);
@@ -1125,19 +1128,8 @@ void Render::renderPlan(RenderPlan& plan,
                 // Render clipping mask layer into tempImage
                 BlendMode tempBlendMode = layerBlendMode;
                 for (int pass = 0; pass < 2; ++pass) {
-                  if (drawExtra && m_extraType == ExtraType::PATCH) {
-                    gfx::Region originalAreas(area.srcBounds());
-                    originalAreas.createSubtraction(originalAreas, gfx::Region(extraArea));
-                    for (auto rc : originalAreas) {
-                      renderCel(tempImage.get(), cel, celImage, layer, pal, celBounds,
-                                gfx::Clip(area.dst.x + rc.x - area.src.x, area.dst.y + rc.y - area.src.y, rc),
-                                compositeImage, opacity, tempBlendMode);
-                    }
-                  }
-                  else {
-                    renderCel(tempImage.get(), cel, celImage, layer, pal, celBounds,
-                              area, compositeImage, opacity, tempBlendMode);
-                  }
+                  renderCel(tempImage.get(), cel, celImage, layer, pal, celBounds,
+                            area, compositeImage, opacity, tempBlendMode);
 
                   if (m_extraType == ExtraType::OVER_COMPOSITE && layer == m_currentLayer &&
                       pass == 0) {
@@ -1253,7 +1245,7 @@ void Render::renderPlan(RenderPlan& plan,
               // OVER_COMPOSITE extra cel, this will be two passes.
               for (int pass = 0; pass < 2; ++pass) {
                 // Draw parts outside the "m_extraCel" area
-                if (drawExtra && m_extraType == ExtraType::PATCH) {
+                if (drawExtra && m_extraType == ExtraType::PATCH && !hasClippingMasksAfter) {
                   gfx::Region originalAreas(area.srcBounds());
                   originalAreas.createSubtraction(originalAreas, gfx::Region(extraArea));
 
