@@ -1,17 +1,11 @@
-# ASEPRITE
-# Copyright (C) 2020  Igara Studio S.A.
+# Aseprite
+# Copyright (C) 2021-2025  Igara Studio S.A.
 
-# Version of Aseprite
-set(VERSION "1.x-dev")
+set(VER_HEADERS
+  ${CMAKE_CURRENT_SOURCE_DIR}/info.h
+  )
 
-configure_file(
-  "${CMAKE_CURRENT_SOURCE_DIR}/generated_version.h.in"
-  "${CMAKE_CURRENT_BINARY_DIR}/generated_version.h")
-
-# Custom Aseprite website (for testing server-side)
-if(NOT "${CUSTOM_WEBSITE_URL}" STREQUAL "")
-  add_definitions(-DCUSTOM_WEBSITE_URL="${CUSTOM_WEBSITE_URL}")
-endif()
-
-add_library(ver-lib info.c ${gen_ver_fn})
-target_include_directories(ver-lib PRIVATE .. "${CMAKE_CURRENT_BINARY_DIR}")
+target_sources(ver-lib PRIVATE ${VER_HEADERS})
+target_compile_definitions(ver-lib PUBLIC
+  -DASEPRITE_VERSION="${ASEPRITE_VERSION}"
+  )
